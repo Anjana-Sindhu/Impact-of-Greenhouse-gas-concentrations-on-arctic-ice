@@ -26,6 +26,7 @@ GHG_FILE = RAW_DIR / "CO2_CH4_conc_1983.xlsx"
 START_DATE = "1983-07-01"
 FORECAST_STEPS = 12
 TEST_STEPS = 24
+MIN_TRAINING_STEPS = 36
 
 SEA_ICE_COLUMNS = [
     "year",
@@ -45,10 +46,26 @@ ANALYSIS_COLUMNS = [
     "avg_CH4_ppb",
 ]
 
+GHG_COLUMNS = {
+    "CO2": ["year", "month", "avg_CO2_ppm"],
+    "CH4": ["year", "month", "avg_CH4_ppb"],
+}
+
 
 def ensure_output_dirs() -> None:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def require_file(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Required input file not found: {path}")
+
+
+def require_columns(df: pd.DataFrame, columns: list[str], source: str) -> None:
+    missing = sorted(set(columns) - set(df.columns))
+    if missing:
+        raise ValueError(f"{source} is missing required columns: {', '.join(missing)}")
 
 
 def add_date_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -64,18 +81,22 @@ def add_date_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_sea_ice() -> pd.DataFrame:
+    require_file(SEA_ICE_FILE)
     xls = pd.ExcelFile(SEA_ICE_FILE)
+    monthly_sheets = [sheet for sheet in xls.sheet_names if sheet.endswith("-NH")]
+    if not monthly_sheets:
+        raise ValueError(f"No Northern Hemisphere monthly sheets found in {SEA_ICE_FILE}")
+
     frames = []
 
-    for sheet in xls.sheet_names:
-        if sheet == "Documentation":
-            continue
+    for sheet in monthly_sheets:
         frame = pd.read_excel(
             SEA_ICE_FILE,
             sheet_name=sheet,
             header=9,
             usecols=SEA_ICE_COLUMNS,
         )
+        require_columns(frame, SEA_ICE_COLUMNS, f"{SEA_ICE_FILE.name}:{sheet}")
         frames.append(frame)
 
     sea_ice = pd.concat(frames, ignore_index=True)
@@ -85,6 +106,7 @@ def load_sea_ice() -> pd.DataFrame:
 
 
 def load_greenhouse_gases() -> pd.DataFrame:
+    require_file(GHG_FILE)
     co2 = pd.read_excel(GHG_FILE, sheet_name="CO2")
     ch4 = pd.read_excel(GHG_FILE, sheet_name="CH4")
 
@@ -94,6 +116,8 @@ def load_greenhouse_gases() -> pd.DataFrame:
     ch4 = ch4.rename(
         columns={"Year": "year", "Month": "month", "average NH": "avg_CH4_ppb"}
     )
+    require_columns(co2, GHG_COLUMNS["CO2"], f"{GHG_FILE.name}:CO2")
+    require_columns(ch4, GHG_COLUMNS["CH4"], f"{GHG_FILE.name}:CH4")
 
     ghg = pd.merge(
         co2[["year", "month", "avg_CO2_ppm"]],
@@ -118,6 +142,7 @@ def build_datasets() -> tuple[pd.DataFrame, pd.DataFrame]:
     merged = add_date_column(merged).sort_values("date").set_index("date")
 
     monthly = merged.asfreq("MS")
+    monthly.index.name = "date"
     monthly[ANALYSIS_COLUMNS] = monthly[ANALYSIS_COLUMNS].interpolate(method="time")
     monthly = monthly.dropna(subset=["extent", "avg_CO2_ppm", "avg_CH4_ppb"])
 
@@ -228,6 +253,11 @@ def fit_sarimax(endog: pd.Series, exog: pd.DataFrame):
 
 def run_forecast(monthly: pd.DataFrame) -> pd.DataFrame:
     model_df = monthly[["extent", "avg_CO2_ppm", "avg_CH4_ppb"]].dropna()
+    if len(model_df) <= TEST_STEPS + MIN_TRAINING_STEPS:
+        raise ValueError(
+            "Not enough monthly observations for SARIMAX validation. "
+            f"Need more than {TEST_STEPS + MIN_TRAINING_STEPS}, got {len(model_df)}."
+        )
 
     train = model_df.iloc[:-TEST_STEPS]
     test = model_df.iloc[-TEST_STEPS:]
@@ -238,6 +268,18 @@ def run_forecast(monthly: pd.DataFrame) -> pd.DataFrame:
     validation_forecast = validation_result.get_forecast(
         steps=len(test), exog=test[["avg_CO2_ppm", "avg_CH4_ppb"]]
     ).summary_frame()
+    validation_forecast.index = test.index
+
+    validation_output = pd.DataFrame(
+        {
+            "actual_extent": test["extent"],
+            "predicted_extent": validation_forecast["mean"],
+            "mean_ci_lower": validation_forecast["mean_ci_lower"],
+            "mean_ci_upper": validation_forecast["mean_ci_upper"],
+        }
+    )
+    validation_output.index.name = "date"
+    validation_output.to_csv(PROCESSED_DIR / "model_validation_predictions.csv")
 
     mae = mean_absolute_error(test["extent"], validation_forecast["mean"])
     rmse = np.sqrt(mean_squared_error(test["extent"], validation_forecast["mean"]))
@@ -270,7 +312,11 @@ def run_forecast(monthly: pd.DataFrame) -> pd.DataFrame:
     forecast = full_result.get_forecast(steps=FORECAST_STEPS, exog=future_exog)
     forecast_frame = forecast.summary_frame()
     forecast_frame.index = future_index
-    forecast_frame.to_excel(PROCESSED_DIR / "sea_ice_extent_12_month_forecast.xlsx")
+    forecast_frame.index.name = "date"
+    forecast_frame.to_excel(
+        PROCESSED_DIR / "sea_ice_extent_12_month_forecast.xlsx",
+        index_label="date",
+    )
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(model_df.index, model_df["extent"], label="Observed", linewidth=1.8)
